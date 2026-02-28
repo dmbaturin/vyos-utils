@@ -55,7 +55,7 @@ type options = {
 
 let default_options = {
   dry_run = false;
-  debug = false;
+  debug = true;
   vyos_command = "<VyOS command is undefined>";
 }
 
@@ -71,6 +71,9 @@ let command_error msg = raise (Command_error msg)
 
 exception Permission_error
 let permission_error () = raise Permission_error
+
+exception Constraint_error of string
+let constraint_error msg = raise (Constraint_error msg)
 
 exception Incomplete_command
 
@@ -126,7 +129,9 @@ let get_node_data op_node =
   let open Yojson.Safe.Util in
   let res = member "__node_data" op_node in
   match res with
-  | (`Assoc _) as d -> d
+  | (`Assoc _) as d ->
+    let () = Logs.debug @@ fun m -> m "Node data: %s" (Yojson.Safe.pretty_to_string d) in
+    d
   | `Null ->
     Printf.ksprintf internal_error "Op node has no data!\n"
   | _ ->
@@ -166,6 +171,33 @@ let get_virtual_tag_node node =
   match res with
   | `Null -> None
   | _ -> Some res
+
+let get_constraints node_data =
+  let open Yojson.Safe.Util in
+  let get_strings dict_path json =
+    let res = path dict_path json in
+    match res with
+    | None -> []
+    | Some v ->
+      begin
+        try
+          to_list v |> List.map to_string
+       with Type_error (msg, _) ->
+         Printf.ksprintf internal_error
+           "Malformed constraints: %s" msg
+      end
+  in
+  let regexes = get_strings ["constraints"; "regexes"] node_data in
+  let validators = get_strings ["constraints"; "validators"] node_data in
+  (regexes, validators)
+
+let get_constraint_error_msg  node_data =
+  let open Yojson.Safe.Util in
+  let res = member "constraint_error_message" node_data in
+  match res with
+  | `String msg -> Some msg
+  | `Null -> None
+  | _ -> Printf.ksprintf internal_error "constraint error message must be a string"
 
 (* Command permission checks *)
 
@@ -236,7 +268,7 @@ let is_admin () =
       false
   end
 
-let has_unsafe_characters cmd =
+let has_unsafe_characters word =
   (* XXX: this function is highly restrictive now,
      until we are completely certain that shell escape
      cannot happen down the line inside VyOS op mode scripts.
@@ -244,6 +276,7 @@ let has_unsafe_characters cmd =
      should allow operator users to use most commands
      that take interface names, FQDNs, and config entities
      like IPsec peer names.
+
      Notable exceptions are:
        - 'show bgp regexp': regexes naturally require '$' and other
          patently shell-unsafe characters.
@@ -253,16 +286,102 @@ let has_unsafe_characters cmd =
          to get around the restriction.
        - 'add system image': requires non-alphanumeric characters
          for URLs.
+
+    Those exceptions are either handled by node-level constraints
+    or just disallowed for the time being.
    *)
-  let () = Logs.debug @@ fun m -> m "Checking the command for unsafe characters" in
+  let () = Logs.debug @@ fun m -> m "Checking argument for unsafe characters" in
   try
-    let _ = Pcre2.exec ~pat:{|[^a-zA-Z0-9_\-\.\s]|} cmd in
-    let () =
-      Printf.fprintf stderr "Command [%s] contains special characters \
-        that operator-level users are not allowed to use\n" cmd
-    in
+    let _ = Pcre2.exec ~pat:{|[^a-zA-Z0-9_\-\.\s]|} word in
     true
   with Not_found -> false
+
+let regex_matches value regex =
+  try
+    let () = Logs.debug @@
+      fun m -> m "Validating command argument %s against regex constraint %s" value regex
+    in
+    (* Constraints in command definition files are implied to match the full string,
+       so we wrap it in ^$
+     *)
+    let regex = Printf.sprintf "^%s$" regex in
+    let _ = Pcre2.exec ~pat:regex value in
+    let () = Logs.debug @@ fun m -> m "Regex matched" in
+    true
+  with
+  | Not_found ->
+    let () = Logs.debug @@ fun m -> m "Regex did not match" in
+    false
+  | Pcre2.Error _ ->
+    Printf.ksprintf internal_error
+      "Failed to validate command word '%s' against regular expression '%s'"
+      value regex
+
+let validator_succeeds val_cmd value =
+  (* XXX: Unix.system is "shelling out", which is generally a bad idea.
+     Here it's likely fine because:
+     1. This function is called before setuid
+        so if someone manages to pull off a shell escape,
+        that will only execute commands with _their own_ privileges.
+     2. Strings with single and double quotes in them are rejected early,
+        so the most common approach to shell escape is ruled out.
+     3. The value in the command is in single quotes,
+        so nothing inside it will be expanded.
+   *)
+  let () = Logs.debug @@
+    fun m -> m "Validating command argument %s against validator command %s" value val_cmd
+  in
+  let cmd = Printf.sprintf {|%s '%s' 2>&1|} val_cmd value in
+  let result = Unix.system cmd in
+  match result with
+  | Unix.WEXITED 0 ->
+    let () = Logs.debug @@ fun m -> m "External validator matched" in
+    true
+  | Unix.WEXITED 127 ->
+    let () = Printf.printf "Could not execute validator %s" val_cmd in
+    false
+  | _ ->
+    let () = Logs.debug @@ fun m -> m "External validator did not match" in
+    false
+
+let check_for_quotes s =
+  let () = Logs.debug @@ fun m -> m "Checking if command argument [%s] has quote characters" s in
+  if (String.contains s '\'') || (String.contains s '"')
+  then Printf.ksprintf constraint_error "Quote characters are not allowed in command arguments"
+  else ()
+
+let validate_argument node_data word =
+  let () = Logs.debug @@ fun m -> m "Validating command argument %s" word in
+  (* Reject strings with quotes inside them to prevent shell errors or escapes *)
+  let () = check_for_quotes word in
+  (* Check constraints *)
+  let regexes, validators = get_constraints node_data in
+  let constraint_error_msg = get_constraint_error_msg node_data in
+  match (regexes, validators) with
+  | [], [] ->
+    (* If a node doesn't specify constraints, we allow any arguments
+       and let the script handle it however it wants,
+       as long as the argument only contains safe characters.
+     *)
+    let () = Logs.debug @@ fun m -> m "Node has no constraints" in
+    if has_unsafe_characters word
+    then Printf.ksprintf constraint_error "Command argument [%s] contains special characters \
+        that operator-level users are not allowed to use\n" word
+    else ()
+  | _, _ ->
+    (* If a node has constraints, its argument is accepted only if it satisfies them,
+       whether it looks safe otherwise or not.
+     *)
+    let () = Logs.debug @@ fun m -> m "Validating argument %s against constraints" word in
+    if (List.exists (regex_matches word) regexes) then ()
+    else if List.exists (validator_succeeds word) validators then ()
+    else begin
+      match constraint_error_msg with
+      | Some msg ->
+        Printf.ksprintf constraint_error "Incorrect argument %s: %s" word msg
+      | None ->
+        Printf.ksprintf constraint_error "Incorrect argument %s" word
+    end
 
 let is_admin_only_command cmd =
   let rec prefix_matches prefix target =
@@ -300,9 +419,6 @@ let check_command_permissions perms cmd =
   let () = Logs.debug @@ fun m -> m "Checking if the user is allowed to execute the command" in
   (* VyOS admins can execute any commands without restrictions *)
   if is_admin () then () else
-  (* Operators are not allowed to execute commands
-     with potentially unsafe characters in them *)
-  if has_unsafe_characters (String.concat " " cmd) then permission_error () else
   (* Some commands are unconditionally denied to operators *)
   if is_admin_only_command cmd then permission_error () else
   (* Operator level users must always be in groups
@@ -402,6 +518,7 @@ let rec run_vyos_command opts ?(env=[]) ?(parent="") node cmd_words =
         begin match ws with
         | [] ->
           let command = get_command node_data in
+          let () = validate_argument node_data w in
           run_external_command opts env command
         | _ as ws ->
           run_vyos_command opts ~env:env ~parent:w node ws
@@ -412,6 +529,8 @@ let rec run_vyos_command opts ?(env=[]) ?(parent="") node cmd_words =
         begin match ws with
         | [] ->
           let vtn_data = get_node_data vtn in
+          let () = Logs.debug @@ fun m -> m "We are in a virtual tag node" in
+          let () = validate_argument vtn_data w in
           let command = get_command vtn_data in
           run_external_command opts env command
         | _ ->
@@ -511,6 +630,10 @@ let () =
   | Permission_error ->
     Printf.fprintf stderr "You do not have a permission to execute VyOS command [%s]\n"
       options.vyos_command;
+    exit 1
+  | Constraint_error msg ->
+    Printf.fprintf stderr "Cannot execute VyOS commands [%s]:\n%s"
+      options.vyos_command msg;
     exit 1
   | Invalid_command msg ->
     Printf.fprintf stderr "Invalid command [%s]: %s\n" options.vyos_command msg;
